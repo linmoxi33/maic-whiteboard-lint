@@ -1,0 +1,26 @@
+{
+  "stage": {
+    "id": "demo-stage",
+    "whiteboard": [
+      {
+        "id": "wb-1",
+        "viewportSize": 1000,
+        "viewportRatio": 0.5625,
+        "elements": [
+          {"type": "latex", "id": "t1", "left": 100, "top": 100, "width": 200, "height": 60, "rotate": 0, "latex": "\\alpha"},
+          {"type": "text", "id": "t2", "left": 180, "top": 120, "width": 200, "height": 60, "rotate": 0, "content": "<p>a ray</p>"},
+          {"type": "line", "id": "l1", "left": 0, "top": 0, "start": [0, 130], "end": [400, 130], "points": ["", "arrow"]},
+          {"type": "shape", "id": "s1", "left": 900, "top": 500, "width": 200, "height": 100, "rotate": 30, "path": "M0 0 L1 1", "viewBox": [1, 1], "fill": "#5b9bd5"}
+        ]
+      },
+      {
+        "id": "wb-2",
+        "viewportSize": 1000,
+        "viewportRatio": 0.5625,
+        "elements": [
+          {"type": "text", "id": "c1", "left": 40, "top": 40, "width": 300, "height": 80, "rotate": 0, "content": "<p>clean board</p>"}
+        ]
+      }
+    ]
+  }
+}

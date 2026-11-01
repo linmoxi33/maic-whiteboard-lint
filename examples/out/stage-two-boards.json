@@ -1,0 +1,82 @@
+{
+  "ok": false,
+  "canvas": {
+    "width": 1000,
+    "height": 563
+  },
+  "overlap_threshold": 0.3,
+  "upstream_algorithm": "lib/orchestration/summarizers/whiteboard-conflicts.ts",
+  "whiteboards_linted": 2,
+  "conflicts_total": 4,
+  "rotation_blindspots": [
+    {
+      "tag": "whiteboard",
+      "id": "wb-1",
+      "rotated_elements": [
+        {
+          "id": "s1",
+          "label": "shape",
+          "rotate": 30
+        }
+      ],
+      "false_negatives": []
+    }
+  ],
+  "whiteboards": [
+    {
+      "tag": "whiteboard",
+      "id": "wb-1",
+      "element_count": 4,
+      "conflict_count": 4,
+      "conflicts": [
+        {
+          "type": "OVERLAP",
+          "level": "error",
+          "a": "t1",
+          "b": "t2",
+          "a_label": "latex \"\\alpha\"",
+          "b_label": "text \"a ray\"",
+          "percent": 40,
+          "message": "latex \"\\alpha\"[t1] and text \"a ray\"[t2] share 40% of the smaller one's area"
+        },
+        {
+          "type": "LINE_CROSSES",
+          "level": "error",
+          "line": "l1",
+          "bbox": "t1",
+          "line_label": "arrow",
+          "bbox_label": "latex \"\\alpha\"",
+          "message": "arrow[l1] passes through latex \"\\alpha\"[t1]"
+        },
+        {
+          "type": "LINE_CROSSES",
+          "level": "error",
+          "line": "l1",
+          "bbox": "t2",
+          "line_label": "arrow",
+          "bbox_label": "text \"a ray\"",
+          "message": "arrow[l1] passes through text \"a ray\"[t2]"
+        },
+        {
+          "type": "OUT_OF_CANVAS",
+          "level": "error",
+          "id": "s1",
+          "label": "shape",
+          "edge": [
+            "right edge by 100px",
+            "bottom edge by 37px"
+          ],
+          "message": "shape[s1] extends past right edge by 100px, bottom edge by 37px"
+        }
+      ]
+    },
+    {
+      "tag": "whiteboard",
+      "id": "wb-2",
+      "element_count": 1,
+      "conflict_count": 0,
+      "conflicts": []
+    }
+  ],
+  "rotation_false_negatives_total": 0
+}

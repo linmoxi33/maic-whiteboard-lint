@@ -1,0 +1,13 @@
+{
+  "stage": {
+    "whiteboard": [
+      {
+        "id": "wb-rot",
+        "elements": [
+          {"type": "shape", "id": "big", "left": 0, "top": 0, "width": 300, "height": 300, "rotate": 0},
+          {"type": "shape", "id": "tilted", "left": 275, "top": 100, "width": 100, "height": 100, "rotate": 45}
+        ]
+      }
+    ]
+  }
+}

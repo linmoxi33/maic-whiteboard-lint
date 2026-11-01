@@ -1,0 +1,49 @@
+{
+  "ok": false,
+  "canvas": {
+    "width": 1000,
+    "height": 563
+  },
+  "overlap_threshold": 0.3,
+  "upstream_algorithm": "lib/orchestration/summarizers/whiteboard-conflicts.ts",
+  "whiteboards_linted": 1,
+  "conflicts_total": 0,
+  "rotation_blindspots": [
+    {
+      "tag": "whiteboard",
+      "id": "wb-rot",
+      "rotated_elements": [
+        {
+          "id": "tilted",
+          "label": "shape",
+          "rotate": 45
+        }
+      ],
+      "false_negatives": [
+        {
+          "type": "ROTATION_FALSE_NEGATIVE",
+          "level": "warn",
+          "a": "big",
+          "b": "tilted",
+          "plain_percent": 25,
+          "rotated_percent": 32,
+          "rotates": {
+            "big": 0,
+            "tilted": 45
+          },
+          "message": "shape[big] and shape[tilted]: upstream sees 25% overlap (passes), true rotated AABB is 32% (collides)"
+        }
+      ]
+    }
+  ],
+  "whiteboards": [
+    {
+      "tag": "whiteboard",
+      "id": "wb-rot",
+      "element_count": 2,
+      "conflict_count": 0,
+      "conflicts": []
+    }
+  ],
+  "rotation_false_negatives_total": 1
+}

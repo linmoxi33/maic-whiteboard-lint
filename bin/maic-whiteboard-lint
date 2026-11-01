@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""
+maic-whiteboard-lint
+
+Offline linter for OpenMAIC whiteboard layout conflicts.
+Replicates the exact geometric algorithm in
+  THU-MAIC/OpenMAIC lib/orchestration/summarizers/whiteboard-conflicts.ts
+(axis-aligned relative-overlap >= 30%, line-crosses-bbox, canvas-edge
+clipping on a 1000x563 canvas) but as a structured, assertable tool:
+  machine-readable --json output, fixed exit codes, and it lints EVERY
+  whiteboard in a stage -- not just the last one the upstream only inspects.
+
+Exit codes:
+  0  no layout conflicts
+  1  one or more layout conflicts found
+  2  usage or input error (unreadable / unparsable / wrong shape)
+"""
+
+import argparse
+import json
+import sys
+
+# Upstream constants -- THU-MAIC/OpenMAIC whiteboard-conflicts.ts
+CANVAS_WIDTH = 1000
+CANVAS_HEIGHT = 563
+OVERLAP_THRESHOLD = 0.3  # intersection / min-area; flag if >= 30%
+
+
+# --------------------------------------------------------------------------
+# Geometry (mirrors whiteboard-conflicts.ts exactly)
+# --------------------------------------------------------------------------
+def strip_html(html):
+    return "" if html is None else __import__("re").sub(r"<[^>]*>", "", str(html)).strip()
+
+
+def element_label(el):
+    t = el.get("type")
+    if t == "text":
+        s = strip_html(el.get("content", ""))[:24]
+        return "text \"%s%s\"" % (s, "…" if len(s) >= 24 else "")
+    if t == "latex":
+        s = str(el.get("latex", ""))[:24]
+        return "latex \"%s%s\"" % (s, "…" if len(s) >= 24 else "")
+    if t == "shape":
+        s = strip_html((el.get("text") or {}).get("content", ""))[:16]
+        return "shape \"%s\"" % s if s else "shape"
+    if t == "table":
+        return "table %dx%d" % (len(el.get("data") or []), len((el.get("data") or [[]])[0] or []))
+    if t == "chart":
+        return "chart[%s]" % (el.get("chartType") or "unknown")
+    if t == "code":
+        return "code(%s)" % (el.get("language") or "unknown")
+    if t == "image":
+        return "image"
+    if t == "line":
+        return "arrow" if "arrow" in (el.get("points") or []) else "line"
+    return el.get("type") or "element"
+
+
+def to_bbox(el):
+    if el.get("type") == "line":
+        return None
+    if not isinstance(el.get("left"), (int, float)) or not isinstance(el.get("top"), (int, float)):
+        return None
+    if not isinstance(el.get("width"), (int, float)) or not isinstance(el.get("height"), (int, float)):
+        return None
+    return {
+        "id": el.get("id") or "",
+        "type": el.get("type"),
+        "label": element_label(el),
+        "x": float(el.get("left")),
+        "y": float(el.get("top")),
+        "w": float(el.get("width")),
+        "h": float(el.get("height")),
+    }
+
+
+def to_line_seg(el):
+    if el.get("type") != "line":
+        return None
+    lx = el.get("left") or 0
+    ly = el.get("top") or 0
+    sx, sy = (el.get("start") or [0, 0])
+    ex, ey = (el.get("end") or [0, 0])
+    return {
+        "id": el.get("id") or "",
+        "label": element_label(el),
+        "x1": lx + sx,
+        "y1": ly + sy,
+        "x2": lx + ex,
+        "y2": ly + ey,
+    }
+
+
+def relative_overlap(a, b):
+    x1 = max(a["x"], b["x"])
+    y1 = max(a["y"], b["y"])
+    x2 = min(a["x"] + a["w"], b["x"] + b["w"])
+    y2 = min(a["y"] + a["h"], b["y"] + b["h"])
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+    inter = (x2 - x1) * (y2 - y1)
+    min_area = min(a["w"] * a["h"], b["w"] * b["h"])
+    return inter / min_area if min_area > 0 else 0.0
+
+
+def _ccw(x1, y1, x2, y2, x3, y3):
+    return (y3 - y1) * (x2 - x1) - (x3 - x1) * (y2 - y1)
+
+
+def segments_intersect(ax1, ay1, ax2, ay2, bx1, by1, bx2, by2):
+    d1 = _ccw(bx1, by1, bx2, by2, ax1, ay1)
+    d2 = _ccw(bx1, by1, bx2, by2, ax2, ay2)
+    d3 = _ccw(ax1, ay1, ax2, ay2, bx1, by1)
+    d4 = _ccw(ax1, ay1, ax2, ay2, bx2, by2)
+    return ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and \
+           ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0))
+
+
+def point_in_rect(px, py, b):
+    return b["x"] <= px <= b["x"] + b["w"] and b["y"] <= py <= b["y"] + b["h"]
+
+
+def line_crosses_bbox(line, b):
+    if point_in_rect(line["x1"], line["y1"], b) or point_in_rect(line["x2"], line["y2"], b):
+        return True
+    edges = [
+        (b["x"], b["y"], b["x"] + b["w"], b["y"]),
+        (b["x"] + b["w"], b["y"], b["x"] + b["w"], b["y"] + b["h"]),
+        (b["x"] + b["w"], b["y"] + b["h"], b["x"], b["y"] + b["h"]),
+        (b["x"], b["y"] + b["h"], b["x"], b["y"]),
+    ]
+    for ex1, ey1, ex2, ey2 in edges:
+        if segments_intersect(line["x1"], line["y1"], line["x2"], line["y2"], ex1, ey1, ex2, ey2):
+            return True
+    return False
+
+
+def _short_id(i):
+    return "[%s]" % i[:8] if i else ""
+
+
+# --------------------------------------------------------------------------
+# Rotation blind spot (B-tier new dimension)
+#
+# Upstream's toBBox() reads left/top/width/height and NEVER reads `rotate`
+# (whiteboard-conflicts.ts contains zero `rotat` references). A rotated
+# element's true axis-aligned footprint is larger than its unrotated AABB,
+# so the upstream check can MISS overlaps between rotated elements. We
+# compute the true rotated AABB and report every pair the upstream's
+# rotate-ignoring check silently passes.
+# --------------------------------------------------------------------------
+def rotated_bbox(el):
+    """AABB of a rectangle rotated `rotate` degrees about its center.
+    Returns None if no usable geometry or rotate is 0/absent."""
+    if el.get("type") == "line":
+        return None
+    rot = el.get("rotate")
+    if not isinstance(rot, (int, float)) or rot == 0:
+        return None
+    b = to_bbox(el)
+    if b is None:
+        return None
+    import math
+    th = math.radians(rot)
+    cx = b["x"] + b["w"] / 2.0
+    cy = b["y"] + b["h"] / 2.0
+    hw, hh = b["w"] / 2.0, b["h"] / 2.0
+    hw2 = abs(hw * math.cos(th)) + abs(hh * math.sin(th))
+    hh2 = abs(hw * math.sin(th)) + abs(hh * math.cos(th))
+    return {"id": b["id"], "label": b["label"],
+            "x": cx - hw2, "y": cy - hh2, "w": 2 * hw2, "h": 2 * hh2,
+            "rotate": rot}
+
+
+def detect_rotation_blindspots(elements):
+    """Find rotated elements and pairs that the upstream (rotate-ignoring)
+    detector marks clean but whose true rotated AABBs collide."""
+    rotated = {}
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        rb = rotated_bbox(el)
+        if rb is not None:
+            rotated[rb["id"]] = rb
+
+    blind = []
+    if rotated:
+        plain = {}
+        for el in elements:
+            if not isinstance(el, dict):
+                continue
+            b = to_bbox(el)
+            if b is not None:
+                plain[b["id"]] = b
+        ids = list(plain.keys())
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                a, b = plain[ids[i]], plain[ids[j]]
+                if a["id"] not in rotated and b["id"] not in rotated:
+                    continue
+                plain_ratio = relative_overlap(a, b)
+                ra = rotated.get(a["id"], a)
+                rb = rotated.get(b["id"], b)
+                true_ratio = relative_overlap(ra, rb)
+                if plain_ratio < OVERLAP_THRESHOLD <= true_ratio:
+                    blind.append({
+                        "type": "ROTATION_FALSE_NEGATIVE",
+                        "level": "warn",
+                        "a": a["id"],
+                        "b": b["id"],
+                        "plain_percent": round(plain_ratio * 100),
+                        "rotated_percent": round(true_ratio * 100),
+                        "rotates": {a["id"]: rotated.get(a["id"], {}).get("rotate", 0),
+                                    b["id"]: rotated.get(b["id"], {}).get("rotate", 0)},
+                        "message": "%s%s and %s%s: upstream sees %d%% overlap (passes), "
+                                   "true rotated AABB is %d%% (collides)"
+                                   % (a["label"], _short_id(a["id"]), b["label"], _short_id(b["id"]),
+                                      round(plain_ratio * 100), round(true_ratio * 100)),
+                    })
+    return {"rotated_elements": [
+        {"id": r["id"], "label": r["label"], "rotate": r["rotate"]}
+        for r in rotated.values()
+    ], "false_negatives": blind}
+
+
+# --------------------------------------------------------------------------
+# Conflict engine -- mirrors buildWhiteboardConflicts but returns findings
+# --------------------------------------------------------------------------
+def detect_conflicts(elements):
+    """Return a list of structured finding dicts (conflicts), like upstream
+    but machine-readable."""
+    findings = []
+    if not elements:
+        return findings
+
+    bboxes = []
+    lines = []
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        if el.get("type") == "line":
+            seg = to_line_seg(el)
+            if seg:
+                lines.append(seg)
+        else:
+            b = to_bbox(el)
+            if b:
+                bboxes.append(b)
+
+    for i in range(len(bboxes)):
+        for j in range(i + 1, len(bboxes)):
+            ratio = relative_overlap(bboxes[i], bboxes[j])
+            if ratio >= OVERLAP_THRESHOLD:
+                findings.append({
+                    "type": "OVERLAP",
+                    "level": "error",
+                    "a": bboxes[i]["id"],
+                    "b": bboxes[j]["id"],
+                    "a_label": bboxes[i]["label"],
+                    "b_label": bboxes[j]["label"],
+                    "percent": round(ratio * 100),
+                    "message": "%s%s and %s%s share %d%% of the smaller one's area"
+                               % (bboxes[i]["label"], _short_id(bboxes[i]["id"]),
+                                  bboxes[j]["label"], _short_id(bboxes[j]["id"]),
+                                  round(ratio * 100)),
+                })
+
+    for line in lines:
+        for b in bboxes:
+            if line_crosses_bbox(line, b):
+                findings.append({
+                    "type": "LINE_CROSSES",
+                    "level": "error",
+                    "line": line["id"],
+                    "bbox": b["id"],
+                    "line_label": line["label"],
+                    "bbox_label": b["label"],
+                    "message": "%s%s passes through %s%s"
+                               % (line["label"], _short_id(line["id"]),
+                                  b["label"], _short_id(b["id"])),
+                })
+
+    for b in bboxes:
+        out = []
+        if b["x"] < 0:
+            out.append("left edge by %dpx" % round(-b["x"]))
+        if b["y"] < 0:
+            out.append("top edge by %dpx" % round(-b["y"]))
+        if b["x"] + b["w"] > CANVAS_WIDTH:
+            out.append("right edge by %dpx" % round(b["x"] + b["w"] - CANVAS_WIDTH))
+        if b["y"] + b["h"] > CANVAS_HEIGHT:
+            out.append("bottom edge by %dpx" % round(b["y"] + b["h"] - CANVAS_HEIGHT))
+        if out:
+            findings.append({
+                "type": "OUT_OF_CANVAS",
+                "level": "error",
+                "id": b["id"],
+                "label": b["label"],
+                "edge": out,
+                "message": "%s%s extends past %s" % (b["label"], _short_id(b["id"]), ", ".join(out)),
+            })
+
+    return findings
+
+
+def upstream_text(findings):
+    """Render the exact upstream prompt block for parity, if conflict."""
+    if not findings:
+        return ""
+    lines_out = []
+    for f in findings:
+        if f["type"] == "OVERLAP":
+            lines_out.append("  - OVERLAP: %s" % f["message"])
+        elif f["type"] == "LINE_CROSSES":
+            lines_out.append("  - LINE CROSSES: %s" % f["message"])
+        else:
+            lines_out.append("  - OUT OF CANVAS: %s" % f["message"])
+    return "\n## \u26a0 Layout Conflicts Detected (computed from current whiteboard JSON)\n%s\n" % \
+           "\n".join(lines_out)
+
+
+# --------------------------------------------------------------------------
+# Input parsing: extract whiteboards from stage.json / whiteboard.json
+# --------------------------------------------------------------------------
+def iter_whiteboards(data):
+    """Yield (tag, whiteboard_id, elements) for every whiteboard found.
+    Handles several input shapes:
+    - stage.json:  data.stage.whiteboard[] and data.scenes[].content whiteboards
+    - manifest:    data.scenes[].whiteboard[] (scenes at top level)
+    - bare:        data.elements[] or a bare list of elements
+    """
+    if isinstance(data, list):
+        yield ("elements", None, data)
+        return
+    if not isinstance(data, dict):
+        return
+    if isinstance(data.get("elements"), list) and data["elements"]:
+        yield ("elements", data.get("id"), data["elements"])
+        return
+    # stage.stage.whiteboard[] -- each whiteboard has .elements
+    stage = data.get("stage")
+    if isinstance(stage, dict):
+        wbs = stage.get("whiteboard")
+        if isinstance(wbs, list):
+            for wb in wbs:
+                el = wb["elements"] if isinstance(wb, dict) else wb
+                if isinstance(el, list):
+                    yield ("whiteboard", wb.get("id") if isinstance(wb, dict) else None, el)
+        sceneries = stage.get("scenes") or stage.get("contents")
+        if isinstance(sceneries, list):
+            for sc in sceneries:
+                if isinstance(sc, dict):
+                    for t in _scene_whiteboards(sc):
+                        yield t
+    # manifest-shaped: scenes at top level
+    if isinstance(data.get("scenes"), list):
+        for sc in data["scenes"]:
+            if isinstance(sc, dict):
+                for t in _scene_whiteboards(sc):
+                    yield t
+
+
+def _scene_whiteboards(sc):
+    """Collect whiteboards present in a single scene dict."""
+    content = sc.get("content")
+    if isinstance(content, dict):
+        wb = content.get("whiteboard")
+        if isinstance(wb, list):
+            for w in wb:
+                el = w["elements"] if isinstance(w, dict) else w
+                if isinstance(el, list):
+                    yield ("scene:" + str(sc.get("id", "")),
+                           w.get("id") if isinstance(w, dict) else None, el)
+        if isinstance(content.get("elements"), list) and content["elements"]:
+            yield ("slidedeck:" + str(sc.get("id", "")), None, content["elements"])
+    if isinstance(sc.get("whiteboard"), list):
+        for wb in sc["whiteboard"]:
+            el = wb["elements"] if isinstance(wb, dict) else wb
+            if isinstance(el, list):
+                yield ("scene:" + str(sc.get("id", "")),
+                       wb.get("id") if isinstance(wb, dict) else None, el)
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="maic-whiteboard-lint",
+        description="Offline OpenMAIC whiteboard layout conflict linter.")
+    p.add_argument("input", help="Path to stage.json or whiteboard.json")
+    p.add_argument("--json", action="store_true",
+                   help="Emit machine-readable JSON report to stdout")
+    p.add_argument("--only-last", action="store_true",
+                   help="Only lint the last whiteboard (upstream behavior) "
+                        "-- default lints every whiteboard")
+    p.add_argument("--quiet", action="store_true", help="Suppress human text output")
+    p.add_argument("--strict-rotation", action="store_true",
+                   help="Also fail (exit 1) on rotation blind spots: pairs the "
+                        "upstream rotate-ignoring AABB check misses")
+    args = p.parse_args(argv)
+
+    try:
+        with open(args.input, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        json_err(2, {"ok": False, "error": "no such file: %s" % args.input})
+        return 2
+    except json.JSONDecodeError as e:
+        json_err(2, {"ok": False, "error": "invalid JSON: %s" % e})
+        return 2
+
+    wbs = []
+    for tag, wid, elements in iter_whiteboards(data):
+        wbs.append((tag, wid, elements))
+    if not wbs:
+        json_err(2, {"ok": False, "error": "no whiteboard elements found in input"})
+        return 2
+
+    if args.only_last:
+        wbs = wbs[-1:]
+
+    all_findings = {}
+    any_conflict = False
+    rotation_all = []
+    for tag, wid, elements in wbs:
+        cons = detect_conflicts(elements)
+        all_findings[(tag, wid)] = {"elements": len(elements), "conflicts": cons}
+        if cons:
+            any_conflict = True
+        rot = detect_rotation_blindspots(elements)
+        if rot["rotated_elements"] or rot["false_negatives"]:
+            rotation_all.append({"tag": tag, "id": wid, **rot})
+
+    report = {
+        "ok": not any_conflict,
+        "canvas": {"width": CANVAS_WIDTH, "height": CANVAS_HEIGHT},
+        "overlap_threshold": OVERLAP_THRESHOLD,
+        "upstream_algorithm": "lib/orchestration/summarizers/whiteboard-conflicts.ts",
+        "whiteboards_linted": len(wbs),
+        "conflicts_total": sum(len(v["conflicts"]) for v in all_findings.values()),
+        "rotation_blindspots": rotation_all,
+        "whiteboards": []
+    }
+    for (tag, wid), v in all_findings.items():
+        report["whiteboards"].append({
+            "tag": tag,
+            "id": wid,
+            "element_count": v["elements"],
+            "conflict_count": len(v["conflicts"]),
+            "conflicts": v["conflicts"],
+        })
+
+    blind_count = sum(len(r["false_negatives"]) for r in rotation_all)
+    report["rotation_false_negatives_total"] = blind_count
+    report["ok"] = not any_conflict and not (args.strict_rotation and blind_count)
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        if not args.quiet:
+            for wb in report["whiteboards"]:
+                for c in wb["conflicts"]:
+                    print("%s %s" % (c["type"], c["message"]))
+            for rb in rotation_all:
+                for fn in rb["false_negatives"]:
+                    print("ROTATION_FALSE_NEGATIVE %s" % fn["message"])
+                if rb["rotated_elements"]:
+                    print("note: %d rotated element(s) whose unused `rotate` the upstream "
+                          "AABB check ignores" % len(rb["rotated_elements"]))
+            print("canvas %dx%d, threshold %d%%" % (CANVAS_WIDTH, CANVAS_HEIGHT, round(OVERLAP_THRESHOLD * 100)))
+            print("whiteboards linted: %d, conflicts: %d"
+                  % (report["whiteboards_linted"], report["conflicts_total"]))
+
+    return 0 if not any_conflict and not (args.strict_rotation and blind_count) else 1
+
+
+def json_err(code, obj):
+    print(json.dumps(obj, ensure_ascii=False), file=sys.stderr)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
